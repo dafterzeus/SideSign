@@ -9,6 +9,10 @@
 import Foundation
 import GSACryptoKit
 
+private enum PushedCodeState {
+    @TaskLocal static var handled = false
+}
+
 public extension DeveloperPortal {
 
     func authenticate(appleID unsanitizedAppleID: String,
@@ -185,40 +189,47 @@ public extension DeveloperPortal {
         }
 
         verboseLog("[SideSign] Parse complete. dsid: \(dsid), token: \(idmsToken)")
-        
+
         // 2FA auth type
         let statusDictionary = completeResponseDictionary["Status"] as? [String: any Sendable]
         let authType = (statusDictionary?["au"] as? String)
            ?? (completeResponseDictionary["au"] as? String)
+           ?? ((statusDictionary?["hsc"] as? Int) == 409 ? "pushedCode" : nil)
         verboseLog("[SideSign] Authentication status type: \(authType ?? "nil")")
 
         let twoFactorAuthContext = TwoFactorAuthContext(
-            dsid: dsid, 
-            idmsToken: idmsToken, 
-            anisetteData: anisetteData, 
+            dsid: dsid,
+            idmsToken: idmsToken,
+            anisetteData: anisetteData,
             xcodeVersion: xcodeVersion
         )
 
         switch authType {
-            case "trustedDeviceSecondaryAuth", "trustedDevice", "secondaryAuth", "sms", "voice", "phone":
-                let isTrustedDevice = (authType == "trustedDeviceSecondaryAuth" || authType == "trustedDevice")
+            case "trustedDeviceSecondaryAuth", "trustedDevice", "secondaryAuth", "sms", "voice", "phone", "pushedCode":
+                let pushedCode = authType == "pushedCode"
+                guard !pushedCode || !PushedCodeState.handled else {
+                    throw DeveloperPortalError.requiresTwoFactorAuthentication
+                }
+                let isTrustedDevice = pushedCode || authType == "trustedDeviceSecondaryAuth" || authType == "trustedDevice"
                 try await handle2FARequest(
                     isTrustedDevice: isTrustedDevice,
                     completeResponseDictionary: completeResponseDictionary,
                     statusDictionary: statusDictionary,
                     context: twoFactorAuthContext,
-                    verificationHandler: verificationHandler
+                    verificationHandler: verificationHandler,
+                    codeAlreadySent: pushedCode
                 )
-                // recur coz we just solved 2FA above and this invocation shouldn't come to this case
-                return try await authenticate(
-                    appleID: unsanitizedAppleID, 
-                    password: password, 
-                    anisetteData: anisetteData, 
-                    xcodeVersion: xcodeVersion, 
-                    machinePassword: machinePassword, 
-                    accountRepairHandler: accountRepairHandler, 
-                    verificationHandler: verificationHandler
-                )
+                return try await PushedCodeState.$handled.withValue(PushedCodeState.handled || pushedCode) {
+                    try await authenticate(
+                        appleID: unsanitizedAppleID,
+                        password: password,
+                        anisetteData: anisetteData,
+                        xcodeVersion: xcodeVersion,
+                        machinePassword: machinePassword,
+                        accountRepairHandler: accountRepairHandler,
+                        verificationHandler: verificationHandler
+                    )
+                }
 
             case "repair":
                 let directRepairURL = completeResponseDictionary["repairUrl"] as? String
@@ -572,7 +583,8 @@ public extension DeveloperPortal {
                             completeResponseDictionary: [String: any Sendable],
                             statusDictionary: [String: any Sendable]?,
                             context: TwoFactorAuthContext,
-                            verificationHandler: VerificationHandler?) async throws 
+                            verificationHandler: VerificationHandler?,
+                            codeAlreadySent: Bool = false) async throws
     {
         guard let verificationHandler else {
             debugLog("[SideSign] 2FA required but no verificationHandler provided")
@@ -586,11 +598,10 @@ public extension DeveloperPortal {
 
         let preferredMode: TwoFactorDeliveryMode = isTrustedDevice ? .trustedDevice : .sms
 
-        var currentRequest: TwoFactorRequest = .selectDeliveryMethod(
-            preferredMode: preferredMode,
-            phoneNumbers: phoneNumbers
-        )
-        var activeChannel: TwoFactorAuthChannel? = nil
+        var currentRequest: TwoFactorRequest = codeAlreadySent
+            ? .trustedDevice(error: nil)
+            : .selectDeliveryMethod(preferredMode: preferredMode, phoneNumbers: phoneNumbers)
+        var activeChannel: TwoFactorAuthChannel? = codeAlreadySent ? .trustedDevice : nil
 
         while true {
             debugLog("[SideSign] Prompting user with 2FA request (\(currentRequest))...")
@@ -720,9 +731,9 @@ public extension DeveloperPortal {
         let errorMsg = (responseDict?["em"] as? String)
                    ?? ((responseDict?["Status"] as? [String: any Sendable])?["em"] as? String)
 
-        if errorCode == GrandSlamAuthErrorCodes.tooManyAttempts 
-            || errorCode == GrandSlamAuthErrorCodes.tooManyCodesRequested 
-            || errorCode == GrandSlamAuthErrorCodes.rateLimited 
+        if errorCode == GrandSlamAuthErrorCodes.tooManyAttempts
+            || errorCode == GrandSlamAuthErrorCodes.tooManyCodesRequested
+            || errorCode == GrandSlamAuthErrorCodes.rateLimited
             || statusCode == HTTPStatusCodes.tooManyRequests
         {
             let msg = errorMsg ?? "Verification codes cannot be sent to this phone number at this time. Please try again later."
@@ -839,9 +850,9 @@ public extension DeveloperPortal {
                     ?? xmluiMessage
                     ?? xmluiTitle
 
-        if errorCode == GrandSlamAuthErrorCodes.tooManyAttempts 
-            || errorCode == GrandSlamAuthErrorCodes.tooManyCodesRequested 
-            || errorCode == GrandSlamAuthErrorCodes.rateLimited 
+        if errorCode == GrandSlamAuthErrorCodes.tooManyAttempts
+            || errorCode == GrandSlamAuthErrorCodes.tooManyCodesRequested
+            || errorCode == GrandSlamAuthErrorCodes.rateLimited
             || statusCode == HTTPStatusCodes.tooManyRequests
         {
             let msg = errorMsg ?? "Too many verification code attempts. Please try again later."
