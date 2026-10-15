@@ -252,6 +252,7 @@ public final class AnisetteDataManager: @unchecked Sendable {
         let identifier: UUID
         let data: AnisetteData
         let newAdiBlob: Data?
+        let provisioningBlob: Data?
         let timestamp: Date
     }
     private var remoteCache: RemoteAnisetteCacheEntry?
@@ -440,72 +441,60 @@ public final class AnisetteDataManager: @unchecked Sendable {
         var userAgent = headers?.userAgent ?? Constants.Anisette.defaultUserAgent
 
         if case .remote(let serverURL) = resolvedMode {
-            if headers?.clientInfo == nil || headers?.clientInfo == Constants.Anisette.defaultClientInfo {
-                if let info = try? await RemoteAnisetteDataProvider(serverURL: serverURL).fetchClientInfo() {
-                    clientInfo = info.clientInfo
-                    userAgent = info.userAgent
-                    debugLog("[AnisetteDataManager] Using dynamically negotiated client_info from \(serverURL.absoluteString): \(clientInfo)")
-                }
-            }
+            // The server identity must also reach AnisetteKit's direct Apple SPIM requests.
+            // Saved Pixel/Mac overrides cannot describe a Windows ADI provider.
+            let info = try await RemoteAnisetteDataProvider(serverURL: serverURL).fetchClientInfo()
+            clientInfo = info.clientInfo
+            userAgent = info.userAgent
         }
 
         let effectiveHeaders = (headers ?? AnisetteRequestHeaders()).with {
             $0.clientInfo = clientInfo
             $0.userAgent = userAgent
+            if case .remote = resolvedMode {
+                // Match the V3 provisioning identity and the resync md_lu value.
+                var uuid = identifier.uuid
+                let bytes = withUnsafeBytes(of: &uuid) { Data($0) }
+                $0.deviceID = identifier.uuidString.uppercased()
+                $0.localUserID = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+            }
         }
 
         let client = try await getClient(for: resolvedMode, clientInfo: clientInfo, userAgent: userAgent)
 
         do {
-            let (rawHeaders, newBlob) = try await client.getAnisetteData(
-                identifier: identifier,
-                storage: .memory(existingBlob: existingAdiBlob),
-                headers: effectiveHeaders
-            )
-
-            let anisetteData = try Self.validateAndCreateAnisetteData(from: rawHeaders)
-
-            if case .remote(let serverURL) = resolvedMode {
-                remoteCache = RemoteAnisetteCacheEntry(
-                    serverURL: serverURL,
+            let result: (headers: [String: String], newBlob: Data?)
+            do {
+                result = try await client.getAnisetteData(
                     identifier: identifier,
-                    data: anisetteData,
-                    newAdiBlob: newBlob,
-                    timestamp: Date()
+                    storage: .memory(existingBlob: existingAdiBlob),
+                    headers: effectiveHeaders
                 )
-            }
-
-            return (anisetteData, newBlob)
-        } catch let err as AnisetteError where self.isStateDesynced(err) {
-            debugLog("[AnisetteDataManager] Server indicated state is de-synchronized / not provisioned (-45061). Reprovisioning...")
-            let (rawHeaders, newBlob) = try await client.getAnisetteData(
-                identifier: identifier,
-                storage: .memory(existingBlob: nil),
-                headers: effectiveHeaders
-            )
-            let anisetteData = try Self.validateAndCreateAnisetteData(from: rawHeaders)
-
-            if case .remote(let serverURL) = resolvedMode {
-                remoteCache = RemoteAnisetteCacheEntry(
-                    serverURL: serverURL,
-                    identifier: identifier,
-                    data: anisetteData,
-                    newAdiBlob: newBlob,
-                    timestamp: Date()
-                )
-            }
-
-            return (anisetteData, newBlob)
-        } catch {
-            if case .remote(let serverURL) = resolvedMode, remoteCache?.serverURL == serverURL {
+            } catch let error as AnisetteError where isStateDesynced(error) {
+                // Retry provisioning once. A second failure is surfaced to the caller.
                 remoteCache = nil
+                _ = try await onError?(error)
+                result = try await client.getAnisetteData(
+                    identifier: identifier,
+                    storage: .memory(existingBlob: nil),
+                    headers: effectiveHeaders
+                )
             }
-            if let errorHandler = onError {
-                let shouldContinue = try await errorHandler(error)
-                guard shouldContinue else {
-                    throw error
-                }
+            let anisetteData = try Self.validateAndCreateAnisetteData(from: result.headers)
+            if case .remote(let serverURL) = resolvedMode {
+                remoteCache = RemoteAnisetteCacheEntry(
+                    serverURL: serverURL,
+                    identifier: identifier,
+                    data: anisetteData,
+                    newAdiBlob: result.newBlob,
+                    provisioningBlob: result.newBlob ?? existingAdiBlob,
+                    timestamp: Date()
+                )
             }
+            return (anisetteData, result.newBlob)
+        } catch {
+            remoteCache = nil
+            _ = try await onError?(error)
             throw error
         }
     }
@@ -526,34 +515,36 @@ public final class AnisetteDataManager: @unchecked Sendable {
         currentData: AnisetteData,
         existingAdiBlob: Data? = nil
     ) async throws -> AnisetteData {
-        guard let resolvedMode = self.activeMode else {
-            throw AnisetteError.modeNotConfigured
+        // Failover fetches use an explicit mode, so activeMode can be unset or stale.
+        guard let cache = remoteCache,
+              cache.data.deviceID == currentData.deviceID,
+              let blob = existingAdiBlob ?? cache.provisioningBlob, !blob.isEmpty else {
+            throw AnisetteError.providerNotReady("No matching remote provisioning state for anisette resync")
         }
-
-        switch resolvedMode {
-        case .remote(let serverURL):
-            let provider = RemoteAnisetteDataProvider(serverURL: serverURL)
-            let resolvedUUID = remoteCache?.identifier ?? UUID(uuidString: currentData.deviceID) ?? UUID()
-            var uuidVal = resolvedUUID.uuid
-            let identifierBytes = withUnsafeBytes(of: &uuidVal) { Array($0) }
-            let adiBlob = existingAdiBlob ?? remoteCache?.newAdiBlob ?? Data()
-
-            let rawResponse = try await provider.getAnisetteHeaders(
-                libDir: "",
-                provisioningDir: provisioningDir.path,
-                identifier: identifierBytes,
-                adiPb: [UInt8](adiBlob),
-                sim: sim,
-                deviceID: currentData.deviceID,
-                localUserID: currentData.localUserID
-            )
-            var resynced = currentData
-            resynced.oneTimePassword = rawResponse.oneTimePassword
-            resynced.machineID = rawResponse.machineID
-            return resynced
-        default:
-            throw AnisetteError.badServerResponse(statusCode: -1, payload: "Anisette resync only supported for remote mode")
-        }
+        var uuid = cache.identifier.uuid
+        let bytes = withUnsafeBytes(of: &uuid) { Array($0) }
+        let provider = RemoteAnisetteDataProvider(serverURL: cache.serverURL)
+        let response = try await provider.getAnisetteHeaders(
+            libDir: "",
+            provisioningDir: provisioningDir.path,
+            identifier: bytes,
+            adiPb: [UInt8](blob),
+            sim: sim,
+            deviceID: currentData.deviceID,
+            localUserID: currentData.localUserID
+        )
+        var resynced = currentData
+        resynced.oneTimePassword = response.oneTimePassword
+        resynced.machineID = response.machineID
+        remoteCache = RemoteAnisetteCacheEntry(
+            serverURL: cache.serverURL,
+            identifier: cache.identifier,
+            data: resynced,
+            newAdiBlob: cache.newAdiBlob,
+            provisioningBlob: blob,
+            timestamp: Date()
+        )
+        return resynced
     }
 
     private func getClient(for mode: AnisetteMode, clientInfo: String, userAgent: String = Constants.Anisette.defaultUserAgent) async throws -> AnisetteClient {

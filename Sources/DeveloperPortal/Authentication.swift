@@ -105,6 +105,11 @@ public extension DeveloperPortal {
             throw ServerError.underlyingError(code: ec, message: errorDesc ?? "Authentication init failed")
         }
 
+        if let status = initResponse["Status"] as? [String: any Sendable],
+           (status["hsc"] as? Int) == 434 {
+            throw ServerError.badServerResponse(reason: "Anisette resync was not accepted", jsonPayload: prettyJSONString(from: initResponse))
+        }
+
         guard let c = initResponse["c"] as? String,
               let salt = initResponse["s"] as? Data,
               let iterations = initResponse["i"] as? Int,

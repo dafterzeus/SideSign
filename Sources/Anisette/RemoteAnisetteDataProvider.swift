@@ -75,7 +75,12 @@ public struct RemoteAnisetteDataProvider: AnisetteDataProvider, Sendable {
             throw AnisetteError.badServerResponse(statusCode: status, payload: "Failed to fetch client_info from \(serverURL.absoluteString)")
         }
 
-        return try JSONDecoder().decode(AnisetteClientInfo.self, from: data)
+        let info = try JSONDecoder().decode(AnisetteClientInfo.self, from: data)
+        guard !info.clientInfo.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !info.userAgent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw AnisetteError.invalidAnisetteData
+        }
+        return info
     }
 
     public func getAnisetteHeaders(
@@ -104,7 +109,7 @@ public struct RemoteAnisetteDataProvider: AnisetteDataProvider, Sendable {
         deviceID: String? = nil,
         localUserID: String? = nil
     ) async throws -> AnisetteDataResponse {
-        let cleanIdentifier = identifier.map { String(format: "%02x", $0) }.joined()
+        let cleanIdentifier = Data(identifier).base64EncodedString()
         let baseURL = serverURL.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
 
         // 1. If adiPb is present, attempt v3 /v3/get_headers
@@ -127,48 +132,26 @@ public struct RemoteAnisetteDataProvider: AnisetteDataProvider, Sendable {
                 }
                 postReq.httpBody = try JSONSerialization.data(withJSONObject: payload)
 
-                if let (data, response) = try? await URLSession.shared.data(for: postReq),
-                   let httpResp = response as? HTTPURLResponse {
-                    if let json = try? JSONSerialization.jsonObject(with: data) as? [String: String] {
-                        if let result = json["result"], result == "GetHeadersError" {
-                            let msg = json["message"] ?? "GetHeadersError"
-                            if msg.contains("-45061") {
-                                throw AnisetteError.incorrectlyProvisioned(payload: msg)
-                            }
-                            throw AnisetteError.badServerResponse(statusCode: httpResp.statusCode, payload: msg)
-                        }
-                        if httpResp.isSuccess {
-                            return try AnisetteDataResponse(from: json)
-                        }
-                    } else if let str = String(data: data, encoding: .utf8), str.contains("-45061") {
-                        throw AnisetteError.incorrectlyProvisioned(payload: str)
-                    }
+                let (data, response) = try await URLSession.shared.data(for: postReq)
+                let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+                let payload = String(data: data, encoding: .utf8) ?? ""
+                if payload.contains("-45061") {
+                    throw AnisetteError.incorrectlyProvisioned(payload: payload)
                 }
+                guard (200...299).contains(status) else {
+                    throw AnisetteError.badServerResponse(statusCode: status, payload: payload)
+                }
+                guard let json = try JSONSerialization.jsonObject(with: data) as? [String: String] else {
+                    throw AnisetteError.invalidAnisetteData
+                }
+                if json["result"] == "GetHeadersError" {
+                    throw AnisetteError.badServerResponse(statusCode: status, payload: json["message"] ?? payload)
+                }
+                return try AnisetteDataResponse(from: json)
             }
         }
-
-        // 2. Fallback to legacy v1 root GET
-        var request = URLRequest(url: serverURL)
-        request.cachePolicy = .reloadIgnoringLocalCacheData
-        request.timeoutInterval = Constants.Anisette.remoteRequestTimeout
-
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let httpResp = response as? HTTPURLResponse, httpResp.isSuccess else {
-            let status = (response as? HTTPURLResponse)?.statusCode ?? -1
-            let payload = String(data: data, encoding: .utf8) ?? ""
-            throw AnisetteError.badServerResponse(statusCode: status, payload: payload)
-        }
-
-        let rawPayload = String(data: data, encoding: .utf8) ?? ""
-        if rawPayload.contains("-45061") {
-            throw AnisetteError.incorrectlyProvisioned(payload: rawPayload)
-        }
-
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: String] else {
-            throw AnisetteError.invalidAnisetteData
-        }
-
-        return try AnisetteDataResponse(from: json)
+        // Do not silently use a shared V1 identity after a V3 or resync failure.
+        throw AnisetteError.providerNotReady("V3 anisette requires a provisioned adi.pb")
     }
 
     public func startProvision(
@@ -190,7 +173,7 @@ public struct RemoteAnisetteDataProvider: AnisetteDataProvider, Sendable {
         let webSocketTask = URLSession.shared.webSocketTask(with: webSocketURL)
         webSocketTask.resume()
 
-        let cleanIdentifier = identifier.map { String(format: "%02x", $0) }.joined()
+        let cleanIdentifier = Data(identifier).base64EncodedString()
 
         do {
             while true {
