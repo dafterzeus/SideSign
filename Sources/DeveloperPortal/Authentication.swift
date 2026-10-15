@@ -956,7 +956,7 @@ public extension DeveloperPortal {
             "Accept": "application/x-buddyml",
             "Accept-Language": "en-us",
             "Content-Type": "application/x-plist",
-            "User-Agent": h.developerServices.userAgent,
+            "User-Agent": a.userAgent.isEmpty ? h.grandSlam.userAgent : a.userAgent,
             "X-Apple-App-Info": h.grandSlam.authApp,
             "X-Xcode-Version": context.xcodeVersion,
             "X-Apple-Identity-Token": encodedIdentityToken,

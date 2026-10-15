@@ -121,16 +121,16 @@ public struct RemoteAnisetteDataProvider: AnisetteDataProvider, Sendable {
                 postReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
                 postReq.cachePolicy = .reloadIgnoringLocalCacheData
 
-                var payload: [String: String] = [
+                var requestPayload: [String: String] = [
                     "identifier": cleanIdentifier,
                     "adi_pb": Data(adiPb).base64EncodedString()
                 ]
                 if let sim = sim {
-                    payload["sim"] = sim
-                    if let dev = deviceID { payload["device_id"] = dev }
-                    if let lu = localUserID { payload["md_lu"] = lu }
+                    requestPayload["sim"] = sim
+                    if let dev = deviceID { requestPayload["device_id"] = dev }
+                    if let lu = localUserID { requestPayload["md_lu"] = lu }
                 }
-                postReq.httpBody = try JSONSerialization.data(withJSONObject: payload)
+                postReq.httpBody = try JSONSerialization.data(withJSONObject: requestPayload)
 
                 let (data, response) = try await URLSession.shared.data(for: postReq)
                 let status = (response as? HTTPURLResponse)?.statusCode ?? -1
